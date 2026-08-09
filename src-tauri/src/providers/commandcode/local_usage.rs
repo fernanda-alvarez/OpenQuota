@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandCodeUsageEvent {
@@ -13,55 +15,64 @@ pub(crate) struct CommandCodeUsageEvent {
     pub(crate) cache_write_tokens: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawUsageRecord {
+    id: Option<String>,
+    timestamp: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_string")]
+    model: Option<String>,
+    usage: Option<RawUsage>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawUsage {
+    #[serde(default, rename = "inputTokens", deserialize_with = "deserialize_token")]
+    input_tokens: Option<u64>,
+    #[serde(default, rename = "outputTokens", deserialize_with = "deserialize_token")]
+    output_tokens: Option<u64>,
+    #[serde(default, rename = "cacheReadTokens", deserialize_with = "deserialize_token")]
+    cache_read_tokens: Option<u64>,
+    #[serde(default, rename = "cacheWriteTokens", deserialize_with = "deserialize_token")]
+    cache_write_tokens: Option<u64>,
+}
+
 pub(crate) fn parse_jsonl(content: &str) -> Vec<CommandCodeUsageEvent> {
     let mut events = Vec::new();
     let mut indexes = HashMap::new();
 
     for line in content.lines() {
-        let Ok(Value::Object(object)) = serde_json::from_str::<Value>(line) else {
+        let Ok(record) = serde_json::from_str::<RawUsageRecord>(line) else {
             continue;
         };
 
-        let Some(id) = object.get("id").and_then(Value::as_str) else {
+        let Some(id) = record.id else {
             continue;
         };
         if id.is_empty() {
             continue;
         }
 
-        let Some(timestamp) = object
-            .get("timestamp")
-            .and_then(Value::as_str)
+        let Some(timestamp) = record
+            .timestamp
+            .as_deref()
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
             .map(|value| value.with_timezone(&Utc))
         else {
             continue;
         };
 
-        let Some(usage) = object.get("usage").and_then(Value::as_object) else {
-            continue;
-        };
-        let Some(input_tokens) = token_count(usage, "inputTokens") else {
-            continue;
-        };
-        let Some(output_tokens) = token_count(usage, "outputTokens") else {
-            continue;
-        };
-        let Some(cache_read_tokens) = token_count(usage, "cacheReadTokens") else {
-            continue;
-        };
-        let Some(cache_write_tokens) = token_count(usage, "cacheWriteTokens") else {
+        let Some(usage) = record.usage else {
             continue;
         };
 
         let event = CommandCodeUsageEvent {
-            id: id.to_owned(),
+            id: id.clone(),
             timestamp,
-            model: object.get("model").and_then(Value::as_str).map(str::to_owned),
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
+            model: record.model,
+            input_tokens: usage.input_tokens.unwrap_or(0),
+            output_tokens: usage.output_tokens.unwrap_or(0),
+            cache_read_tokens: usage.cache_read_tokens.unwrap_or(0),
+            cache_write_tokens: usage.cache_write_tokens.unwrap_or(0),
         };
 
         if let Some(&index) = indexes.get(id) {
@@ -69,24 +80,12 @@ pub(crate) fn parse_jsonl(content: &str) -> Vec<CommandCodeUsageEvent> {
                 events[index] = event;
             }
         } else {
-            indexes.insert(id.to_owned(), events.len());
+            indexes.insert(id, events.len());
             events.push(event);
         }
     }
 
     events
-}
-
-fn parse_token(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(number) => number.as_u64().or_else(|| parse_float(number.as_f64()?)),
-        Value::String(text) => text.parse::<u64>().ok().or_else(|| parse_float(text.parse().ok()?)),
-        _ => None,
-    }
-}
-
-fn token_count(usage: &serde_json::Map<String, Value>, key: &str) -> Option<u64> {
-    usage.get(key).map(parse_token).unwrap_or(Some(0))
 }
 
 fn parse_float(value: f64) -> Option<u64> {
@@ -95,6 +94,151 @@ fn parse_float(value: f64) -> Option<u64> {
     } else {
         None
     }
+}
+
+fn deserialize_token<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct TokenVisitor;
+
+    impl<'de> Visitor<'de> for TokenVisitor {
+        type Value = Option<u64>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a non-negative finite token count")
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if value >= 0 {
+                Ok(Some(value as u64))
+            } else {
+                Err(E::custom("token count cannot be negative"))
+            }
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            parse_float(value)
+                .map(Some)
+                .ok_or_else(|| E::custom("token count must be finite and non-negative"))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            value
+                .parse::<u64>()
+                .ok()
+                .or_else(|| value.parse::<f64>().ok().and_then(parse_float))
+                .map(Some)
+                .ok_or_else(|| E::custom("invalid token count"))
+        }
+    }
+
+    deserializer.deserialize_any(TokenVisitor)
+}
+
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptionalStringVisitor;
+
+    impl<'de> Visitor<'de> for OptionalStringVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an optional string")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value.to_owned()))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value))
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_seq<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            while access.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            while access.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(OptionalStringVisitor)
 }
 
 fn total_tokens(event: &CommandCodeUsageEvent) -> u128 {
@@ -162,6 +306,16 @@ mod tests {
         assert_eq!(events[0].output_tokens, 2);
         assert_eq!(events[0].cache_read_tokens, 3);
         assert_eq!(events[0].cache_write_tokens, 4);
+    }
+
+    #[test]
+    fn ignores_unknown_content_fields() {
+        let line = r#"{"id":"event-1","timestamp":"2026-08-09T00:00:00Z","usage":{"inputTokens":1},"content":{"conversation":["private text"]}}"#;
+
+        let events = parse_jsonl(line);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].input_tokens, 1);
     }
 
     #[test]
