@@ -1,0 +1,3 @@
+{"type":"assistant","version":1,"id":"event-1","timestamp":"2026-08-09T00:00:00Z","model":"deepseek/deepseek-v4-flash","usage":{"inputTokens":100,"outputTokens":40,"cacheReadTokens":20,"cacheWriteTokens":0},"content":"[redacted]"}
+{"type":"user","version":1,"id":"event-2","timestamp":"2026-08-09T00:00:01Z","content":"[redacted]"}
+{"type":"heartbeat","version":1,"id":"event-3","timestamp":"2026-08-09T00:00:02Z"}
